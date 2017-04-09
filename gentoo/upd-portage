@@ -1,0 +1,45 @@
+#!/bin/sh
+
+
+NAME=`wget -q -O - "http://mirror.netcologne.de/gentoo/releases/amd64/autobuilds/current-stage3-amd64/?C=M;O=D" | grep -o "stage3-amd64-[0-9]*.tar.bz2" |head -1`
+NAME_X86=`wget -q -O - "http://mirror.netcologne.de/gentoo/releases/x86/autobuilds/current-stage3-i686/?C=M;O=D" | grep -o "stage3-i686-[0-9]*.tar.bz2" |head -1`
+rm *.DIGESTS
+wget http://mirror.netcologne.de/gentoo/releases/amd64/autobuilds/current-stage3-amd64/${NAME}.DIGESTS
+
+sha512sum -c ${NAME}.DIGESTS ${NAME} | grep "${NAME}: OK"
+if [ $? != 0 ]
+then
+  rm stage3-latest.tar.bz2 stage3-amd64-*.tar.bz2
+  wget http://mirror.netcologne.de/gentoo/releases/amd64/autobuilds/current-stage3-amd64/$NAME
+echo debug amd64
+echo  http://mirror.netcologne.de/gentoo/releases/amd64/autobuilds/current-stage3-amd64/$NAME
+
+#  ln $NAME stage3-latest.tar.bz2
+fi
+
+echo "##################X86#######################"
+wget http://mirror.netcologne.de/gentoo/releases/x86/autobuilds/current-stage3-i686/${NAME_X86}.DIGESTS
+
+sha512sum -c ${NAME_X86}.DIGESTS ${NAME_X86} | grep "${NAME_X86}: OK"
+if [ $? != 0 ]
+then
+  rm stage3-latest.tar.bz2 stage3-i686-*.tar.bz2
+  wget http://mirror.netcologne.de/gentoo/releases/x86/autobuilds/current-stage3-i686/$NAME_X86
+echo debug x86
+echo http://mirror.netcologne.de/gentoo/releases/x86/autobuilds/current-stage3-i686/$NAME_X86
+
+  ln $NAME_X86 stage3-latest-x86.tar.bz2
+fi
+
+rm portage-latest.tar.xz.md5sum 
+wget http://mirror.netcologne.de/gentoo/releases/snapshots/current/portage-latest.tar.xz.md5sum
+md5sum -c portage-latest.tar.xz.md5sum
+if [ $? != 0 ]
+then
+  rm portage-latest.tar.xz
+  wget http://mirror.netcologne.de/gentoo/releases/snapshots/current/portage-latest.tar.xz
+fi
+
+
+/etc/init.d/rsyncd restart
+

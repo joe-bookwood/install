@@ -1,0 +1,516 @@
+#!/bin/sh
+#set -x
+LANG=C
+
+GIG=1073741824
+MEG=1048576
+DISKPATT="ST3500418AS"
+
+#SFDISK="sfdisk -H 224 -S 56"
+SFDISK="sfdisk"
+HOSTNAME=`dhcpcd -U eth0 | grep host_name  | grep -o '[^=]*$'`
+VG=vg1
+
+LVMPART=`cat << LimitStr
+root;2;G;xfs;/
+usr;2;G;xfs;/usr
+usrsrc;2;G;xfs;/usr/src;512
+portage;576;M;xfs;/usr/portage;512
+distfiles;1;G;xfs;/usr/portage/distfiles;4096
+tmp;512;M;xfs;/tmp;512
+var;512;M;xfs;/var
+vartmp;1;G;xfs;/var/tmp;512
+portagetmp;2;G;xfs;/var/tmp/portage;512
+varlib;1;G;xfs;/var/lib;1024
+swap;3;G;swap
+LimitStr
+`
+
+scandisk ()
+{
+  
+  BLKDEVS=`ls  /sys/block/ | grep "^[a-z]\+$" | grep -v sr`
+  if [ -n "$BLKDEVS" ]
+  then
+    for ADISK in $BLKDEVS
+    do
+      if [ -z "$SIZE" ]
+      then
+        SIZE=`cat /sys/block/$ADISK/size`
+      fi
+      if [ -z "$OSIZE" ] || [ "$SIZE" = "$OSIZE" ]
+      then
+        if [ -z "$DISKS" ]
+	then
+	  DISKS="/dev/$ADISK"
+	else
+          DISKS="$DISKS /dev/$ADISK"
+	fi
+      fi
+      OSIZE=$SIZE
+    done
+  else
+    exit -1
+  fi
+  
+  NUM=0
+  for i in $DISKS
+  do 
+    let NUM=NUM+1
+  done 
+  echo Number of disks: $NUM
+
+  if [ $NUM -gt 2 ]
+  then
+    LEVEL=5
+  else
+    LEVEL=1
+  fi 
+  echo Level: $LEVEL
+
+  if [ $NUM -eq 1 ] || [ ! -f /sbin/mdadm ]
+  then
+    PARTPATT=$DISKS
+  else
+    PARTPATT="/dev/md"
+  fi
+  echo PARTPATT: $PARTPATT
+}
+
+
+check_partition_fdisk ()
+{
+  echo ";" | sfdisk $DISK
+  $SFDISK -l $DISK
+  if [ -z "$DISKBAK" ]
+  then
+    DISKBAK=$DISK
+  fi
+
+  NBPS=`$SFDISK -l $DISK | grep "\(Units\|Einheit\)" | \
+     tr -s ' ' | cut -d' ' -f4`
+  NBPB=`$SFDISK -l $DISK | grep "\(Units\|Einheit\)" | \
+     tr -s ' ' | cut -d' ' -f8`
+
+  if [[ -n "${BPS}" ]] && [[  "${NBPS}" != "${BPS}" ]]
+  then
+    echo "DISKS are not equal $NBPS != $BPS - exiting"
+    exit 1
+  fi
+  BPS="$NBPS"
+  BPB="$NBPB"
+}
+
+create_partition ()
+{
+  echo "partitioning hd $DISKS "
+  for DISK in $DISKS
+  do
+    parted --script $DISK mklabel gpt
+    #parted -s -a optimal $DISK mkpart grub 34s 313343s
+    #parted -s -a optimal $DISK set 1 bios_grub on
+    #parted -s -a optimal $DISK mkpart primary ext2 313344s 300mb
+    #parted -s -a optimal  $DISK mkpart primary xfs 300mb 100%
+    parted -s -a optimal $DISK mkpart primary 1 3
+    parted -s $DISK name 1 grub
+    parted -s -a optimal $DISK set 1 bios_grub on
+    parted -s -a optimal $DISK mkpart primary 3 200mb
+    parted -s $DISK name 2 boot
+    parted -s $DISK set 2 boot on
+    parted -s -a optimal  $DISK mkpart primary 200mb 100%
+    parted -s $DISK name 3 lvm
+    if [ $PARTPATT = "/dev/md" ]
+    then
+      parted -s $DISK set 1 raid on
+      parted -s $DISK set 2 raid on
+      parted -s $DISK set 3 raid on
+    else
+      parted -s $DISK set 3 lvm on
+    fi
+    #parted --list --machine $DISK 
+
+  done
+  if [ $NUM -gt 1 ]
+  then
+      for TDISK in $DISKS
+      do
+        if [ "$TDISK" != "$DISK" ]
+        then
+	  echo "sfdisk -d $DISK | sfdisk -f $TDISK"
+          sfdisk -d $DISK | sfdisk -f $TDISK
+        fi
+      done
+
+
+      #Build Devices
+      for i in 1 2 3
+      do
+        if [ ! -b "/dev/md$i" ]
+        then
+          mknod /dev/md$i b 9 $i
+	fi
+        #Build Raid Devices
+        COUNT=0
+        for DSK in $DISKS
+        do
+          (( COUNT++ ))
+        done
+        for DSK in $DISKS
+        do
+          PRT="${PRT} ${DSK}${i}" 
+        done
+
+	if [ $i -lt 3 ]
+	then
+          echo mdadm --create /dev/md$i --level=1 --metadata=0.90 --raid-devices=$COUNT $PRT
+          mdadm --create /dev/md$i --level=1 --metadata=0.90 --raid-devices=$COUNT $PRT
+	else
+          echo mdadm --create /dev/md$i --level=$LEVEL --raid-devices=$COUNT $PRT
+          mdadm --create /dev/md$i --level=$LEVEL --raid-devices=$COUNT $PRT
+	fi
+        PRT=""
+      done
+    fi
+}
+
+create_partition_fdisk ()
+{
+  grep -q md2 /proc/mdstat 
+  if [ "$?" -eq 1 ]
+  then
+    for DISK in $DISKS
+    do
+      check_partition_fdisk
+    done
+    DISK=$DISKBAK
+    echo "bps=$BPS"
+    DISK_BLOCKS=`$SFDISK -s $DISK`
+    let DISK_SIZE=$DISK_BLOCKS*$BPB
+    echo "DISK_SIZE=$DISK_SIZE BPB=$BPB DISK_BLOCKS=$DISK_BLOCKS"
+
+    echo "$PART" | \
+    awk -v dsz=$DISK_SIZE -v gig=$GIG \
+        -v bps=$BPS -v meg=$MEG -v count=$NUM 'BEGIN{
+      FS=";"
+      n=0
+    }{
+      part[n++]=$1
+      if($3=="M"){
+        size[$1]=(meg*$2)/bps
+      }else{
+        size[$1]=(gig*$2)/bps
+      }
+      if(count==1)
+      {
+        if($1=="swap")
+	{
+          typ[$1]="82"
+	}
+	else
+	{
+          typ[$1]="83"
+	}
+      }
+      else
+      {
+        typ[$1]="fd"
+      }
+    }END{
+      summe=0
+      f=0
+      for(i=0;i<n;i++){
+        p=part[i]
+        sum+=size[p]
+        if(size[p]==0){
+          f++
+        }
+      }
+      rest=(dsz/bps)-sum
+      pflag=0
+      for(i=0;i<n;i++){
+        p=part[i]
+        if(size[p]==0){
+          size[p]=""
+        }
+        pf++
+	if(size[p]<1)
+	{
+	  size[p]=rest
+	}
+        if(pf==1){
+          out=sprintf("0,%d,%s",size[p],typ[p])
+        }else{
+          out=sprintf(",%d,%s",size[p],typ[p])
+        }
+	gsub("\,0\,",",,",out)
+	print(out)
+      }
+    }' | tee debug |$SFDISK -f $DISK
+
+    if [ $NUM -gt 1 ]
+    then
+      for TDISK in $DISKS
+      do
+        if [ "$TDISK" != "$DISK" ]
+        then
+	  echo "sfdisk -d $DISK | sfdisk -f $TDISK"
+          sfdisk -d $DISK | sfdisk -f $TDISK
+        fi
+      done
+
+      #Build Devices
+      for i in 1 2 3
+      do
+        if [ ! -b "/dev/md$i" ]
+        then
+          mknod /dev/md$i b 9 $i
+	fi
+        #Build Raid Devices
+        COUNT=0
+        for DSK in $DISKS
+        do
+          (( COUNT++ ))
+        done
+        for DSK in $DISKS
+        do
+          PRT="${PRT} ${DSK}${i}" 
+        done
+
+	if [ $i -lt 3 ]
+	then
+          echo mdadm --create /dev/md$i --level=1 --metadata=0.90 --raid-devices=$COUNT $PRT
+          mdadm --create /dev/md$i --level=1 --raid-devices=$COUNT $PRT
+	else
+          echo mdadm --create /dev/md$i --level=$LEVEL --raid-devices=$COUNT $PRT
+          mdadm --create /dev/md$i --level=$LEVEL --raid-devices=$COUNT $PRT
+	fi
+        PRT=""
+      done
+    fi
+  fi
+}
+
+create_lvms ()
+{
+  mount | grep /mnt/gentoo |sort | awk '{system("umount "$1)}'
+  pvcreate  ${PARTPATT}3
+  if [ $? -eq 1 ]
+  then
+    exit
+  fi
+  vgcreate -s 32m $VG ${PARTPATT}3
+  vgdisplay | grep "VG Name.*$VG$"
+  if [ $? -eq 1 ]
+  then
+    exit
+  fi
+  DISK_SIZE=`vgdisplay -c $VG | awk 'BEGIN{FS=":"}{print($12*1024)}'` 
+
+  #distfiles;2;G;reiser;/usr/portage/distfiles;4096
+  #lvdisplay | grep  "LV Name" | awk '{system("lvremove -f "$3)}'
+  echo "$LVMPART" | \
+  awk -v dsz=$DISK_SIZE -v gig=$GIG \
+      -v bps=$BPS -v meg=$MEG \
+      -v vg=$VG 'BEGIN{
+  FS=";"
+  n=0
+  }{
+  
+  part[n++]=$1
+  if($3=="M"){
+    size[$1]=(meg*$2)
+  }else{
+    size[$1]=(gig*$2)
+  }
+  typ[$1]="fd"
+  reals[$1]=$2
+  unit[$1]=$3
+  
+  }END{
+  summe=0
+  f=0
+  for(i=0;i<n;i++){
+    p=part[i]
+    sum+=size[p]
+    if(size[p]==0){
+      f++
+    }
+  }
+  rest=dsz-sum
+  pflag=0
+  for(i=0;i<n;i++){
+    p=part[i]
+    if(size[p]==0 && f!=0){
+      size[p]=(rest/f)-gig*0.05
+      if(size[p]>gig)
+      {
+        reals[p]=size[p]/gig
+	unit[p]="G"
+      }
+      else
+      {
+        reals[p]=size[p]/meg
+	unit[p]="M"
+      }
+      print("rest="rest" f="f)
+      print(" sum="sum)
+    }
+    pf++
+    cmd=sprintf("lvcreate -L %d%s -n %s %s\n",reals[p],unit[p],p,vg)
+    print cmd
+    system(cmd)
+  }
+  }'
+}
+
+format_disk ()
+{
+  #mkdosfs -F 32 -n efi-boot /dev/md1
+  echo "ext2 ignores -F "
+  #mkfs.ext2 -L boot -F ${DISKS}2
+  mkfs.ext2 -L boot -F ${DISKS}2
+  #mkfs.vfat -L boot -F ${DISKS}2
+  echo "ext2 finish "
+  
+
+  echo "$LVMPART" | \
+  awk -v vg=$VG 'BEGIN{
+      FS=";"
+      n=0
+    }{
+    n++
+    if(n==3){
+      n++
+    }
+    if($4=="ext2"){
+      system("mkfs.ext2 -L "$1" /dev/"vg"/"$1)
+    }else if($4=="swap"){
+      system("mkswap  -f -L "$1" /dev/"vg"/"$1)
+    }else if($4=="xfs"){
+      if($6>0)
+      {
+        if($6<1924)
+	{
+	  system("mkfs.xfs  -f -m crc=0  -b size="$6" -L "$1" /dev/"vg"/"$1)
+	}
+	else
+	{
+	  system("mkfs.xfs  -f -b size="$6" -L "$1" /dev/"vg"/"$1)
+	}
+      }
+      else
+      {
+        system("mkfs.xfs  -f -L "$1" /dev/"vg"/"$1)
+      }
+    }else if($4=="reiser"){
+      print("mkfs.reiserfs -b "$6" -f -l "$1" /dev/"vg"/"$1)
+    }
+  }'
+}
+
+umount_lvms ()
+{
+  swapoff -L swap
+  if [ -f /sbin/lvs ] 
+  then
+    LVSCOUNT=`lvs | wc -l `
+    if [ `lvs | wc -l ` -gt 0 ]
+    then
+      mount |\
+      grep /mnt/gentoo |\
+      awk '{ print $3 }' |\
+      sort -r |\
+      awk '{system (" umount "$1)}'
+      vgremove -f $VG
+      pvremove -ff ${PARTPATT}2
+    fi
+  fi
+  if [ -f /sbin/mdadm ] 
+  then
+    mdadm --stop --scan
+  fi
+}
+
+mount_lvms ()
+{
+  echo "Mounting:"
+  echo "$LVMPART" | \
+  awk -v disk=$PARTPATT -v vg=$VG 'BEGIN{
+    FS=";"
+    n=0
+    #print("mkdir -p /mnt/gentoo/ ; mount "disk"2 /mnt/gentoo/")
+    print("mkdir -p /mnt/gentoo/boot ; mount "disk"2 /mnt/gentoo/boot")
+  }{
+    if(length($5)>0){
+      print("mkdir -p /mnt/gentoo"$5" ; mount  /dev/"vg"/"$1" /mnt/gentoo"$5"")
+      print("mount /dev/"vg"/"$1" /mnt/gentoo"$5"") >> "mount.sh"
+    }
+  }' | sort -k 3,3 | \
+  awk '{
+    print($0)
+    system($0)
+  }'
+}
+
+echo vgscan
+vgscan
+
+echo scandisk
+scandisk
+sleep 2
+echo umount_lvms
+umount_lvms
+sleep 2
+echo create partitions
+create_partition
+sleep 2
+echo create lvms
+create_lvms
+sleep 2
+echo format disk
+format_disk
+sleep 2
+echo mount lvms
+mount_lvms
+sleep 2
+echo swapon
+swapon -L swap
+
+mkdir -p /mnt/gentoo/etc
+ALL="$PART"
+ALL=$ALL`printf "\n%s" "$LVMPART"`
+echo "$ALL" | \
+awk -v disk=$DISK 'BEGIN{
+FS=";"
+}{
+if($4=="ext2" && $1=="boot"){
+  printf("LABEL=%-17s %-15s %-15s noauto,noatime 1 2\n",$1,$5,"ext2")
+}else if($4=="ext2"){
+  printf("LABEL=%-17s %-15s %-15s noatime        0 1\n",$1,$5,"ext2")
+}else if($4=="xfs"){
+  printf("LABEL=%-17s %-15s %-15s noatime,nobarrier,logbufs=8,logbsize=256k 0 1\n",$1,$5,"xfs")
+}else if($4=="reiser"){
+  printf("LABEL=%-17s %-15s %-15s noatime        0 1\n",$1,$5,"reiserfs")
+}else if($4=="swap"){
+  printf("LABEL=%-17s %-15s %-15s sw             0 0\n",$1,"none","swap")
+}
+}' > /mnt/gentoo/etc/fstab-new
+#}' > /mnt/gentoo/root/fstab-new
+
+
+exit
+
+echo "$LVMPART" | \
+awk -v disk=$DISK 'BEGIN{
+FS=";"
+n=0
+}{
+  if(length($5)>0){
+    print("mkdir -p /mnt/gentoo"$5" ; mount -L "$1" /mnt/gentoo"$5"")
+    print("mount -L "$1" /mnt/gentoo"$5"") >> "mount.sh"
+  }
+}' | sort -k 3,3 | \
+awk '{
+system($0)
+}'
+
