@@ -198,6 +198,7 @@ if [ $SYSTEMD -eq 1 ]
 then
   startService systemd-networkd default
   SYSTEMDGRUB=" init=/usr/lib/systemd/systemd"
+  localectl set-keymap de-latin1-nodeadkeys
 fi
 
 sed -i 's/#SYMLINK=\"no\"/SYMLINK=\"yes\"/g' /etc/genkernel.conf
@@ -206,6 +207,7 @@ cp /proc/mounts /etc/mtab
 cat /proc/mdstat | grep blocks
 if [ $? -eq 0 ]
 then
+  emerge dmraid
   echo "GRUB_CMDLINE_LINUX=\"dolvm dodmraid doscsi transparent_hugepage=always real_root=/dev/mapper/vg1-root$SYSTEMDGRUB\"" >> /etc/default/grub
   genkernel --lvm --dmraid --symlink --menuconfig all
 else
@@ -215,7 +217,6 @@ fi
 
 grub2-install /dev/ROOTPART
 grub2-mkconfig -o /boot/grub/grub.cfg
-localectl set-keymap de-latin1-nodeadkeys
 
 echo "Fehler: ${GERROR}"
 echo "Fehler: ${GERROR}" >/tmp/builderrors
